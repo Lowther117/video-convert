@@ -1,0 +1,5 @@
+_ffmpeg/
+_Converted/
+__pycache__/
+*.part.mp4
+.DS_Store
