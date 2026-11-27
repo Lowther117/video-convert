@@ -22,6 +22,12 @@ Usage
     python convert_videos.py "<folder>"            convert everything in that folder
     python convert_videos.py "<folder>" --force    redo files already in _Converted
     python convert_videos.py "<folder>" --crf 20   quality knob (lower = better/bigger, 18 default)
+    python convert_videos.py "<folder>" --best     slower x264 preset (smaller file, same look)
+
+Size guard
+    Re-encodes are capped at roughly twice the source video bitrate (H.264 needs about
+    that much to match HEVC), so a low-bitrate file - CCTV, screen recordings - can't
+    balloon to many times its original size. Progress shows %, ETA and projected size.
     python convert_videos.py                       prompts for the folder path
 """
 
@@ -130,28 +136,44 @@ def ensure_ffmpeg():
 def probe(ffmpeg: str, ffprobe, path: Path) -> dict:
     """Return {'vcodec','vprofile','pix_fmt','acodec','has_video','has_audio'}."""
     info = {"vcodec": None, "vprofile": "", "pix_fmt": "", "acodec": None,
-            "has_video": False, "has_audio": False}
+            "has_video": False, "has_audio": False,
+            "duration": None, "vbitrate": None, "abitrate": None}
 
     if ffprobe:
         try:
             out = subprocess.run(
-                [ffprobe, "-v", "error", "-print_format", "json", "-show_streams", str(path)],
+                [ffprobe, "-v", "error", "-print_format", "json", "-show_streams",
+                 "-show_format", str(path)],
                 capture_output=True, text=True, timeout=60).stdout
-            for s in json.loads(out).get("streams", []):
+            data = json.loads(out)
+            fmt = data.get("format", {})
+            info["duration"] = _num(fmt.get("duration"))
+            for s in data.get("streams", []):
                 if s.get("codec_type") == "video" and not info["has_video"]:
                     # skip embedded cover art
                     if s.get("disposition", {}).get("attached_pic"):
                         continue
                     info.update(has_video=True, vcodec=s.get("codec_name"),
-                                vprofile=str(s.get("profile", "")), pix_fmt=s.get("pix_fmt", ""))
+                                vprofile=str(s.get("profile", "")), pix_fmt=s.get("pix_fmt", ""),
+                                vbitrate=_num(s.get("bit_rate")))
+                    info["duration"] = info["duration"] or _num(s.get("duration"))
                 elif s.get("codec_type") == "audio" and not info["has_audio"]:
-                    info.update(has_audio=True, acodec=s.get("codec_name"))
+                    info.update(has_audio=True, acodec=s.get("codec_name"),
+                                abitrate=_num(s.get("bit_rate")))
+            # No per-stream video bitrate (common in MKV/TS): work it out from file size.
+            if not info["vbitrate"] and info["duration"]:
+                total = _num(fmt.get("bit_rate")) or path.stat().st_size * 8 / info["duration"]
+                info["vbitrate"] = max(total - (info["abitrate"] or 0), 0) or None
             return info
         except Exception:
             pass  # fall through to ffmpeg -i parsing
 
     err = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path)],
                          capture_output=True, text=True, timeout=60).stderr
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
+    if m:
+        info["duration"] = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        info["vbitrate"] = path.stat().st_size * 8 / info["duration"] if info["duration"] else None
     for line in err.splitlines():
         m = re.search(r"Stream #\d+:\d+.*?: Video: (\w+)(?: \(([^)]*)\))?.*?, (\w+)", line)
         if m and not info["has_video"]:
@@ -162,6 +184,14 @@ def probe(ffmpeg: str, ffprobe, path: Path) -> dict:
         if m and not info["has_audio"]:
             info.update(has_audio=True, acodec=m.group(1).lower())
     return info
+
+
+def _num(v):
+    try:
+        f = float(v)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def plan(path: Path, info: dict):
@@ -180,30 +210,83 @@ def plan(path: Path, info: dict):
 
 
 # --------------------------------------------------------------------------- conversion
-def convert(ffmpeg: str, src: Path, dst: Path, vmode: str, amode: str, crf: int) -> bool:
+MIN_CAP_KBPS = 600   # floor so a tiny-bitrate source still gets a watchable encode
+
+
+def convert(ffmpeg: str, src: Path, dst: Path, vmode: str, amode: str, crf: int,
+            info: dict, preset: str) -> bool:
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(dst.stem + ".part.mp4")
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y",
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostats",
+           "-progress", "pipe:1", "-y",
            "-i", str(src), "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
            "-map_metadata", "0"]
     if vmode == "copy":
         cmd += ["-c:v", "copy"]
     else:
-        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
-                "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p",
+        # No forced -level: x264 picks the right one for the resolution (4.1 is too low
+        # for 1440p/4K and only produced a mislabelled file).
+        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+                "-profile:v", "high", "-pix_fmt", "yuv420p",
                 "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+        if info.get("vbitrate"):
+            cap = max(int(info["vbitrate"] * 2 / 1000), MIN_CAP_KBPS)
+            cmd += ["-maxrate", f"{cap}k", "-bufsize", f"{cap * 2}k"]
+            print(f"      bitrate cap {cap} kbps (source ~{info['vbitrate'] / 1000:.0f} kbps)")
     if amode == "copy":
         cmd += ["-c:a", "copy"]
     else:
         cmd += ["-c:a", "aac", "-b:a", "192k"]
     cmd += ["-movflags", "+faststart", str(tmp)]
 
-    r = subprocess.run(cmd)
-    if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+    rc = run_with_progress(cmd, info.get("duration"))
+    if rc != 0 or not tmp.exists() or tmp.stat().st_size == 0:
         tmp.unlink(missing_ok=True)
         return False
     tmp.replace(dst)
     return True
+
+
+def _hms(sec: float) -> str:
+    sec = int(max(sec, 0))
+    return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def run_with_progress(cmd, duration) -> int:
+    """Run ffmpeg with -progress pipe:1 and draw one updating line: %, speed, ETA, size."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    vals, t0, last = {}, time.time(), 0.0
+    try:
+        for line in proc.stdout:
+            k, _, v = line.strip().partition("=")
+            vals[k] = v
+            if k != "progress":
+                continue
+            now = time.time()
+            if now - last < 0.5 and v != "end":
+                continue
+            last = now
+            done = (_num(vals.get("out_time_us")) or 0) / 1e6
+            size = _num(vals.get("total_size")) or 0
+            speed = vals.get("speed", "").strip() or "?"
+            if duration and done > 0:
+                frac = min(done / duration, 1.0)
+                eta = (now - t0) * (1 - frac) / frac
+                proj = size / frac
+                msg = (f"      {frac * 100:5.1f}%  {_hms(done)} / {_hms(duration)}  "
+                       f"speed {speed}  ETA {_hms(eta)}  "
+                       f"size {human(size)} -> ~{human(proj)}")
+            else:
+                msg = f"      {_hms(done)}  speed {speed}  size {human(size)}"
+            print("\r" + msg.ljust(100), end="", flush=True)
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        proc.wait()
+        print()
+        raise
+    print()
+    return proc.returncode
 
 
 def human(n: float) -> str:
@@ -217,6 +300,7 @@ def human(n: float) -> str:
 def main():
     args = [a for a in sys.argv[1:]]
     force = "--force" in args
+    preset = "slow" if "--best" in args else "veryfast"
     crf = 18
     if "--crf" in args:
         i = args.index("--crf")
@@ -267,7 +351,11 @@ def main():
               f"({info['vcodec']} {info['pix_fmt']} / {info['acodec'] or 'no audio'})")
 
         t1 = time.time()
-        ok = convert(ffmpeg, src, dst, vmode, amode, crf)
+        try:
+            ok = convert(ffmpeg, src, dst, vmode, amode, crf, info, preset)
+        except KeyboardInterrupt:
+            (dst.with_name(dst.stem + ".part.mp4")).unlink(missing_ok=True)
+            sys.exit("\nStopped - partial file removed.")
         if ok:
             print(f"      done in {time.time() - t1:.0f}s  "
                   f"{human(src.stat().st_size)} -> {human(dst.stat().st_size)}")
